@@ -170,7 +170,7 @@
          return {"action": "equip", "data": {"itemId": best.get("id")}, "reason": "Upgrade weapon"}
  
      if not can_act:
-        return None
+         return None
      
      # zone escape
      danger_ids = {z.get("id") if isinstance(z, dict) else z for z in pending_dz}
