@@ -35,8 +35,8 @@ class MoltyAPI:
                 headers=self._headers(),
             )
 
-    def _headers(self) -> dict:
-        h = {}
+def _headers(self) -> dict:
+    h = {}
     if self.api_key:
         h["X-API-Key"] = self.api_key
     return h
