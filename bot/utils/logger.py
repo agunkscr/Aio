@@ -1,18 +1,19 @@
-"""Structured logging for the bot."""
 import logging
-import sys
-from bot.config import LOG_LEVEL
+import os
 
+def get_logger(name: str):
+    level = os.getenv("LOG_LEVEL", "INFO").upper()
 
-def get_logger(name: str) -> logging.Logger:
     logger = logging.getLogger(name)
+
     if not logger.handlers:
-        handler = logging.StreamHandler(sys.stdout)
-        fmt = logging.Formatter(
-            "[%(asctime)s] %(levelname)-7s %(name)-25s │ %(message)s",
-            datefmt="%H:%M:%S",
+        handler = logging.StreamHandler()
+        formatter = logging.Formatter(
+            "[%(asctime)s] %(levelname)-7s %(name)s │ %(message)s",
+            "%H:%M:%S"
         )
-        handler.setFormatter(fmt)
+        handler.setFormatter(formatter)
         logger.addHandler(handler)
-        logger.setLevel(getattr(logging, LOG_LEVEL.upper(), logging.INFO))
+
+    logger.setLevel(level)
     return logger
