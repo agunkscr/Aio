@@ -66,3 +66,25 @@ class VersionManager:
     async def refresh(self):
         log.info("Refreshing version from server...")
         return await self.fetch_remote()
+
+def load_from_skill_file(self):
+    try:
+        from pathlib import Path
+
+        skill_path = Path("skill.md")  # atau path kamu
+        if not skill_path.exists():
+            return None
+
+        text = skill_path.read_text()
+
+        for line in text.splitlines():
+            if line.startswith("version:"):
+                version = line.split(":", 1)[1].strip()
+                log.info("Version from skill.md: %s", version)
+                self.version = version
+                return version
+
+    except Exception as e:
+        log.warning("Failed reading skill.md: %s", e)
+
+    return None
