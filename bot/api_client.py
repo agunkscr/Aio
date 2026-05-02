@@ -8,6 +8,7 @@ from typing import Optional
 from bot.config import API_BASE
 from bot.utils.logger import get_logger
 from bot.utils.rate_limiter import rest_limiter
+from bot.version_manager import VersionManager
 
 log = get_logger(__name__)
 
