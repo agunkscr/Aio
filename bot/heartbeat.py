@@ -1,6 +1,6 @@
 import asyncio
 from bot.api_client import MoltyAPI, APIError
-from bot.config import fetch_server_version
+from bot.version_manager import VersionManager
 from bot.dashboard.state import dashboard_state
 from bot.state_router import determine_state, NO_IDENTITY, IN_GAME, READY_PAID, READY_FREE
 from bot.setup.account_setup import ensure_account_ready
