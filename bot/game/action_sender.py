@@ -1,8 +1,9 @@
 """
 Action envelope builder + cooldown state tracker.
-Builds action messages per actions.md spec.
+UPDATED for newer Molty Royale schema (action.name + params + version)
 """
 from bot.utils.logger import get_logger
+from bot.config import SKILL_VERSION
 
 log = get_logger(__name__)
 
@@ -20,9 +21,7 @@ class ActionSender:
         self.cooldown_remaining_ms = 0
 
     def update_from_result(self, result: dict):
-        """Update state from action_result payload.
-        Per actions.md: canAct and cooldownRemainingMs are at TOP LEVEL of action_result.
-        """
+        """Update state from action_result payload."""
         if isinstance(result, dict):
             self.can_act = result.get("canAct", self.can_act)
             self.cooldown_remaining_ms = result.get("cooldownRemainingMs", 0)
@@ -35,6 +34,61 @@ class ActionSender:
     def can_send_cooldown_action(self) -> bool:
         """Can we send a Group 1 (cooldown) action?"""
         return self.can_act
+
+    # 🔥 UPDATED CORE
+    def build_action(self, action_type: str, data: dict = None,
+                     reasoning: str = "", planned_action: str = "") -> dict:
+        """
+        Build action envelope (NEW schema).
+        Compatible with newer Molty Royale servers.
+        """
+        payload = {
+            "type": "action",
+            "version": SKILL_VERSION,
+            "action": {
+                "name": action_type,
+                "params": data or {}
+            }
+        }
+        return payload
+
+    # ── Convenience builders ──────────────────────────────────────────
+
+    def move(self, region_id: str, reason: str = "") -> dict:
+        return self.build_action("move", {"regionId": region_id})
+
+    def attack(self, target_id: str, target_type: str = "agent", reason: str = "") -> dict:
+        return self.build_action("attack", {
+            "targetId": target_id,
+            "targetType": target_type
+        })
+
+    def use_item(self, item_id: str, reason: str = "") -> dict:
+        return self.build_action("use_item", {"itemId": item_id})
+
+    def interact(self, interactable_id: str, reason: str = "") -> dict:
+        return self.build_action("interact", {"interactableId": interactable_id})
+
+    def rest(self, reason: str = "") -> dict:
+        return self.build_action("rest", {})
+
+    def pickup(self, item_id: str) -> dict:
+        return self.build_action("pickup", {"itemId": item_id})
+
+    def equip(self, weapon_id: str) -> dict:
+        return self.build_action("equip", {"itemId": weapon_id})
+
+    def talk(self, message: str) -> dict:
+        return self.build_action("talk", {"message": message[:200]})
+
+    def whisper(self, target_id: str, message: str) -> dict:
+        return self.build_action("whisper", {
+            "targetId": target_id,
+            "message": message[:200]
+        })
+
+    def broadcast(self, message: str) -> dict:
+        return self.build_action("broadcast", {"message": message[:200]})        return self.can_act
 
     def build_action(self, action_type: str, data: dict = None,
                      reasoning: str = "", planned_action: str = "") -> dict:
