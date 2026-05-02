@@ -5,7 +5,7 @@ All endpoints from api-summary.md with rate limiting and error handling.
 import json
 import httpx
 from typing import Optional
-from bot.config import API_BASE, SKILL_VERSION
+from bot.config import API_BASE
 from bot.utils.logger import get_logger
 from bot.utils.rate_limiter import rest_limiter
 
@@ -36,7 +36,7 @@ class MoltyAPI:
             )
 
     def _headers(self) -> dict:
-    h = {}
+        h = {}
     if self.api_key:
         h["X-API-Key"] = self.api_key
     return h
