@@ -70,7 +70,18 @@ def _headers(self) -> dict:
 
         # Handle version mismatch
         if resp.status_code == 426:
-            raise APIError("VERSION_MISMATCH", "Skill version outdated", 426)
+    # Auto refresh version
+    new_version = await self.version_manager.refresh()
+
+    if new_version:
+        from bot import config
+        config.SKILL_VERSION = new_version
+        log.warning("Updated SKILL_VERSION → %s, retrying...", new_version)
+
+        # retry sekali
+        resp = await self._client.request(method, path, **kwargs)
+    else:
+        raise APIError("VERSION_MISMATCH", "Failed to refresh version", 426)
 
         # Handle rate limiting
         if resp.status_code == 429:
