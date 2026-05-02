@@ -36,11 +36,12 @@ class MoltyAPI:
                 headers=self._headers(),
             )
 
-    def _headers(self) -> dict:
-        h = {}
-        if self.api_key:
-            h["X-API-Key"] = self.api_key
-        return h
+def _headers(self) -> dict:
+    from bot.config import SKILL_VERSION
+    h = {"X-Version": SKILL_VERSION}
+    if self.api_key:
+        h["X-API-Key"] = self.api_key
+    return h
 
     def _safe_parse_json(self, text: str) -> dict:
         """Parse JSON safely, handling malformed/concatenated responses."""
