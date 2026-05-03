@@ -4,10 +4,10 @@ Strategy brain v3.0.0 — Hyper Aggro Edition.
 Perubahan dari v2.1.0:
 ──────────────────────────────────────────────────────────────────────
 [AGGRO] THREAT_WEIGHT: 0.8 → 0.4 — bot lebih berani ngambil risiko
-[AGGRO] PLAYER_BONUS: 20 → 50 — selalu prioritas player vs guardian
+[AGGRO] PLAYER_BONUS: 20 → 150 — selalu prioritas player vs guardian
 [AGGRO] FINISH_OFF_HP_THRESHOLD: 25 → 45 — lebih agresif kejar KO
 [AGGRO] FINISH_OFF_BONUS: 70 → 130 — nilai finish-off jauh lebih tinggi
-[AGGRO] LOOTING_HUNTER_BONUS: 80 → 150 — looter = target utama
+[AGGRO] LOOTING_HUNTER_BONUS: 80 → 50 — looter = target utama
 [AGGRO] EP_MOVE_MIN: 3 → 2 — bergerak lebih agresif
 [AGGRO] EP_REST_UNTIL: 5 → 3 — tidak rebahan, cukup EP langsung jalan
 [AGGRO] Combat ratio P4c: 0.8 → 0.55 — serang bahkan kalau sedikit kalah
@@ -83,8 +83,8 @@ FINISH_OFF_HP_THRESHOLD = 45
 FINISH_OFF_BONUS        = 130
 
 # [AGGRO] Looting hunter bonus — player looting = target utama
-LOOTING_HUNTER_BONUS    = 150
-PLAYER_BONUS            = 50   # [AGGRO] player >> guardian
+LOOTING_HUNTER_BONUS    = 50
+PLAYER_BONUS            = 150   # [AGGRO] player >> guardian
 
 # ── Early game constants ──────────────────────────────────────────────
 EARLY_GAME_TICKS        = 30
