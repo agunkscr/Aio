@@ -366,7 +366,7 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
         if hp < max(35, int(g_dmg * 1.5)) or hp < g_dmg * 0.6:   # flee if HP less than 60% of guardian damage
             safe = _find_safe_region(connections, danger_ids, view)
             if safe:
-                return {"action": "move", "data": {"regionId": safe}, "reason": "GUARDIAN FLEE"})
+                return {"action": "move", "data": {"regionId": safe}, "reason": "GUARDIAN FLEE"}
 
     # 3. Use utility items (Map, Binoculars, Megaphone) — v1.8: add binoculars
     util = _use_utility_item(inventory, hp, ep, alive_count)
