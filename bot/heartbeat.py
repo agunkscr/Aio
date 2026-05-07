@@ -229,7 +229,7 @@ class Heartbeat:
             return
 
         # Successfully joined → play (ws may be None for paid, that's fine)
-        await self._play_game(game_id, agent_id, room_type, ws=ws)
+        await self._play_game(game_id, agent_id, room_type, ws=None)
 
     async def _handle_in_game(self, ctx: dict):
         """Resume or start playing an active game.
