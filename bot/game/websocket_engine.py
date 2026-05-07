@@ -62,34 +62,63 @@ def _update_dz_knowledge(view: dict):
 class WebSocketEngine:
     """Manages the gameplay WebSocket session."""
 
-    def __init__(self, game_id: str, agent_id: str):
+    def __init__(self, game_id: str, agent_id: str, ws=None):
         self.game_id = game_id
         self.agent_id = agent_id
         self.action_sender = ActionSender()
-        self.ws = None
+        self.ws = ws if ws is not None else None  # Gunakan ws yang diberikan atau None
         self.game_result = None
         self.last_view = None
         self._ping_task = None
         self._running = False
-        self._map_just_used = False  # Track if Map was used for learning
+        self._map_just_used = False
         # Dashboard key/name — set by heartbeat before .run()
-        self.dashboard_key = agent_id  # fallback to agent_id
+        self.dashboard_key = agent_id
         self.dashboard_name = "Agent"
 
     async def run(self) -> dict:
         """
         Main gameplay loop. Returns game result dict.
-        Per gotchas.md: connect with X-API-Key only, no gameId/agentId params.
+        If ws was provided externally, skip new connection.
         """
+        self._running = True
+        retry_count = 0
+        max_retries = 5
+
+        # Jika ws sudah ada dari luar, langsung gunakan
+        if self.ws is not None:
+            log.info("Using existing WebSocket from heartbeat")
+            self._ping_task = asyncio.create_task(self._ping_loop())
+            try:
+                async for raw_msg in self.ws:
+                    try:
+                        msg = json.loads(raw_msg)
+                        if not isinstance(msg, dict):
+                            log.warning("Non-dict WS message: %s", type(msg).__name__)
+                            continue
+                        msg_type = msg.get("type", "unknown")
+                        log.debug("WS recv: type=%s", msg_type)
+                        result = await self._handle_message(msg)
+                        if result is not None:
+                            self._running = False
+                            return result
+                    except json.JSONDecodeError:
+                        log.warning("Non-JSON message: %s", raw_msg[:100])
+            except websockets.exceptions.ConnectionClosed as e:
+                log.warning("WebSocket closed: code=%s reason=%s", e.code, e.reason)
+            except Exception as e:
+                log.error("Error in websocket loop: %s", e)
+            finally:
+                if self._ping_task:
+                    self._ping_task.cancel()
+                return self.game_result or {"status": "disconnected"}
+
+        # Jika tidak ada ws, buka koneksi sendiri
         api_key = get_api_key()
         headers = {
             "X-API-Key": api_key,
             "X-Version": SKILL_VERSION,
         }
-
-        self._running = True
-        retry_count = 0
-        max_retries = 5
 
         while self._running and retry_count < max_retries:
             try:
@@ -97,17 +126,15 @@ class WebSocketEngine:
                 async with websockets.connect(
                     WS_URL,
                     additional_headers=headers,
-                    ping_interval=None,  # We handle our own pings
-                    max_size=2**20,  # 1MB max message
+                    ping_interval=None,
+                    max_size=2**20,
                 ) as ws:
                     self.ws = ws
-                    retry_count = 0  # Reset on successful connect
+                    retry_count = 0
                     log.info("✅ WebSocket connected for game=%s", self.game_id)
 
-                    # Start ping keepalive
                     self._ping_task = asyncio.create_task(self._ping_loop())
 
-                    # Message processing loop
                     async for raw_msg in ws:
                         try:
                             msg = json.loads(raw_msg)
@@ -140,13 +167,12 @@ class WebSocketEngine:
 
         return self.game_result or {"status": "disconnected"}
 
+    # ... (sisanya sama persis, tidak ada perubahan) ...
     async def _handle_message(self, msg: dict) -> dict | None:
         """Process a single WebSocket message. Returns game result or None."""
         msg_type = msg.get("type", "")
 
         # ── agent_view ────────────────────────────────────────────────
-        # Per game-loop.md: uses 'view' key for state data
-        # Sent on: initial connect, game start, reconnect, vision change
         if msg_type == "agent_view":
             view = msg.get("view") or msg.get("data") or {}
             if isinstance(view, dict) and view:
@@ -161,10 +187,8 @@ class WebSocketEngine:
                 log.warning("agent_view with empty/invalid view: %s", str(view)[:100])
 
         # ── action_result ─────────────────────────────────────────────
-        # Per actions.md: canAct and cooldownRemainingMs are at TOP LEVEL
         elif msg_type == "action_result":
             success = msg.get("success", False)
-            # canAct is at TOP LEVEL per actions.md, NOT inside data
             self.action_sender.can_act = msg.get("canAct", self.action_sender.can_act)
             self.action_sender.cooldown_remaining_ms = msg.get("cooldownRemainingMs", 0)
 
@@ -172,7 +196,6 @@ class WebSocketEngine:
                 data = msg.get("data", {})
                 action_msg = data.get("message", "") if isinstance(data, dict) else str(data)
                 log.info("Action OK: %s (canAct=%s)", action_msg, msg.get("canAct"))
-                # Track map usage for learning on next view
                 if isinstance(data, dict) and "map" in str(action_msg).lower():
                     self._map_just_used = True
             else:
@@ -182,20 +205,15 @@ class WebSocketEngine:
                 log.warning("Action FAILED: %s — %s (canAct=%s)", err_code, err_msg, msg.get("canAct"))
 
         # ── can_act_changed ───────────────────────────────────────────
-        # Per actions.md: canAct is at TOP LEVEL
         elif msg_type == "can_act_changed":
             self.action_sender.can_act = msg.get("canAct", True)
             self.action_sender.cooldown_remaining_ms = msg.get("cooldownRemainingMs", 0)
             log.info("can_act_changed: canAct=%s", msg.get("canAct"))
-            # Re-evaluate actions with current view
             if self.last_view and msg.get("canAct"):
                 await self._on_agent_view(self.last_view)
 
         # ── turn_advanced ─────────────────────────────────────────────
-        # Per game-loop.md: "turn_advanced is a pure state snapshot for a new turn"
-        # It INCLUDES full 'view' data — MUST be processed like agent_view
         elif msg_type == "turn_advanced":
-            # view can be at msg.view or msg.data.view or inside msg directly
             turn_num = msg.get("turn", "?")
             view = msg.get("view")
             if not view and isinstance(msg.get("data"), dict):
@@ -207,7 +225,6 @@ class WebSocketEngine:
                 self.last_view = view
                 await self._on_agent_view(view)
             elif self.last_view:
-                # No view in message — re-evaluate with last known state
                 await self._on_agent_view(self.last_view)
             else:
                 log.warning("Turn advanced but no view data available")
@@ -215,7 +232,7 @@ class WebSocketEngine:
         # ── game_ended ────────────────────────────────────────────────
         elif msg_type == "game_ended":
             log.info("═══ GAME ENDED ═══")
-            reset_game_state()  # Clear curse tracking for next game
+            reset_game_state()
             self.game_result = msg
             return msg
 
@@ -257,7 +274,6 @@ class WebSocketEngine:
 
         if not self_data.get("isAlive", True):
             log.info("☠️ Agent DEAD — Alive remaining: %s. Waiting for game_ended...", alive_count)
-            # Update dashboard with dead state (don't just return silently!)
             dk = self.dashboard_key
             dashboard_state.update_agent(dk, {
                 "name": self.dashboard_name,
@@ -277,7 +293,6 @@ class WebSocketEngine:
             )
             return
 
-        # Log status
         hp = self_data.get("hp", "?")
         ep = self_data.get("ep", "?")
         region = view.get("currentRegion", {})
@@ -288,45 +303,31 @@ class WebSocketEngine:
             "info", self.dashboard_key
         )
 
-        # Feed dashboard with live game data
         inv = self_data.get("inventory", [])
         enemies = [a for a in view.get("visibleAgents", [])
                    if isinstance(a, dict) and a.get("isAlive") and a.get("id") != self_data.get("id")]
 
-        # Region items: visibleItems entries are WRAPPED: { regionId, item: {id, name, ...} }
-        # We must unwrap the .item sub-object and attach regionId to it.
         region_id = region.get("id", "") if isinstance(region, dict) else ""
 
         def _unwrap_items(raw_items):
-            """Unwrap visibleItems: each entry is { regionId, item: {...} }.
-            Returns flat list of item dicts with regionId attached."""
             result = []
             for entry in raw_items:
                 if not isinstance(entry, dict):
                     continue
                 inner = entry.get("item")
                 if isinstance(inner, dict):
-                    # Attach regionId from wrapper to the inner item
                     inner["regionId"] = entry.get("regionId", "")
                     result.append(inner)
                 elif entry.get("id"):
-                    # Already a flat item (legacy format)
                     result.append(entry)
             return result
 
         region_items = []
-
-        # Strategy 1: currentRegion.items (some game versions embed items here)
         if isinstance(region, dict) and region.get("items"):
             region_items = _unwrap_items(region["items"])
-
-        # Strategy 2: filter visibleItems by regionId
         if not region_items:
             all_visible = _unwrap_items(view.get("visibleItems", []))
-            region_items = [i for i in all_visible
-                            if i.get("regionId") == region_id]
-
-        # Strategy 3: if regionId filter returns nothing, show ALL visible items
+            region_items = [i for i in all_visible if i.get("regionId") == region_id]
         if not region_items:
             all_visible = _unwrap_items(view.get("visibleItems", []))
             if all_visible:
@@ -340,27 +341,14 @@ class WebSocketEngine:
             from bot.strategy.brain import WEAPONS
             weapon_bonus = WEAPONS.get(weapon_name.lower(), {}).get("bonus", 0)
 
-
         def _item_label(i):
-            """Get best display label for an item.
-            Try all possible field names the API might use.
-            """
-            return (i.get("name")
-                    or i.get("typeId")
-                    or i.get("type")
-                    or i.get("itemType")
-                    or i.get("itemName")
-                    or i.get("label")
-                    or i.get("kind")
-                    or str(i.get("id", "?"))[:12])
+            return (i.get("name") or i.get("typeId") or i.get("type") or
+                    i.get("itemType") or i.get("itemName") or i.get("label") or
+                    i.get("kind") or str(i.get("id", "?"))[:12])
 
         def _item_cat(i):
-            """Get item category from any available field."""
-            return (i.get("category")
-                    or i.get("cat")
-                    or i.get("itemCategory")
-                    or i.get("type")
-                    or "")
+            return (i.get("category") or i.get("cat") or i.get("itemCategory") or
+                    i.get("type") or "")
 
         dk = self.dashboard_key
         dashboard_state.update_agent(dk, {
@@ -384,32 +372,27 @@ class WebSocketEngine:
                              for i in region_items[:10]],
         })
 
-        # Map learning: after Map item used, learn from the expanded vision
         if self._map_just_used:
             self._map_just_used = False
             learn_from_map(view)
             log.info("🗺️ Map knowledge updated — DZ tracking active")
 
-        # Continuous DZ tracking from every view
         _update_dz_knowledge(view)
 
-        # Run strategy brain
         can_act = self.action_sender.can_send_cooldown_action()
         decision = decide_action(view, can_act)
 
         if decision is None:
-            return  # No action needed now
+            return
 
         action_type = decision["action"]
         action_data = decision.get("data", {})
         reason = decision.get("reason", "")
 
-        # Check if cooldown action is allowed
         if action_type in COOLDOWN_ACTIONS and not can_act:
             log.debug("Cooldown active — skipping %s", action_type)
             return
 
-        # Build and send per actions.md envelope spec
         payload = self.action_sender.build_action(
             action_type, action_data, reason, action_type,
         )
@@ -417,7 +400,6 @@ class WebSocketEngine:
         await self._send(payload)
         log.info("→ %s | %s", action_type.upper(), reason)
 
-        # Feed dashboard with action
         dashboard_state.update_agent(self.dashboard_key, {"last_action": f"{action_type}: {reason[:60]}"})
         dashboard_state.add_log(f"{action_type}: {reason[:80]}", "info", self.dashboard_key)
 
@@ -439,16 +421,3 @@ class WebSocketEngine:
             pass
         except Exception as e:
             log.debug("Ping loop error: %s", e)
-"""
-Per game-loop.md §9 Message Types:
-| Type              | Key Fields                                           |
-|-------------------|------------------------------------------------------|
-| agent_view        | gameId, agentId, status, view, reason?               |
-| turn_advanced     | turn, view                                           |
-| action_result     | success, data?, error?, canAct, cooldownRemainingMs  |
-| can_act_changed   | canAct: true, cooldownRemainingMs: 0                 |
-| event             | eventType, ...payload                                |
-| game_ended        | gameId, agentId                                      |
-| waiting           | gameId, agentId, message                             |
-| pong              | —                                                    |
-"""
