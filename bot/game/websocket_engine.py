@@ -2,9 +2,8 @@
 WebSocket gameplay engine — wss://cdn.moltyroyale.com/ws/agent.
 Core loop: connect → process messages → decide → act → repeat.
 
-Fixes (v1.8.1):
-- Now calls decide_actions() and sends all free actions + main cooldown action.
-- Correctly skips cooldown actions when can_act=False.
+Fixes (v1.8.2):
+- Pass current_tick to strategy functions to enable cooldowns.
 """
 import json
 import asyncio
@@ -12,7 +11,7 @@ import websockets
 from bot.config import WS_URL, SKILL_VERSION
 from bot.credentials import get_api_key
 from bot.game.action_sender import ActionSender, COOLDOWN_ACTIONS, FREE_ACTIONS
-from bot.strategy.brain import decide_actions, reset_game_state, learn_from_map  # v1.8.1: use decide_actions
+from bot.strategy.brain import decide_actions, reset_game_state, learn_from_map
 from bot.dashboard.state import dashboard_state
 from bot.utils.rate_limiter import ws_limiter
 from bot.utils.logger import get_logger
@@ -354,9 +353,10 @@ class WebSocketEngine:
 
         _update_dz_knowledge(view)
 
-        # ── v1.8.1: Use decide_actions to get ALL actions (free + main) ──
+        # ── v1.8.2: Ambil current_tick dan teruskan ke decide_actions ──
+        current_turn = view.get("turn", 0)   # asumsi view memiliki field 'turn'
         can_act = self.action_sender.can_send_cooldown_action()
-        decisions = decide_actions(view, can_act)   # returns list of dicts
+        decisions = decide_actions(view, can_act, current_turn)
 
         for decision in decisions:
             action_type = decision["action"]
