@@ -1,7 +1,5 @@
 """
 WebSocket gameplay engine — wss://cdn.moltyroyale.com/ws/agent.
-Optimized for brain v1.7.3: free action chaining + BotSpeak + ally detection.
-
 Core loop: connect → process messages → decide → act → repeat.
 
 Per game-loop.md:
@@ -18,13 +16,7 @@ import websockets
 from bot.config import WS_URL, SKILL_VERSION
 from bot.credentials import get_api_key
 from bot.game.action_sender import ActionSender, COOLDOWN_ACTIONS, FREE_ACTIONS
-from bot.strategy.brain import (
-    decide_actions,
-    reset_game_state,
-    learn_from_map,
-    decode_botspeak,
-    _set_ally,
-)
+from bot.strategy.brain import decide_action, reset_game_state, learn_from_map
 from bot.dashboard.state import dashboard_state
 from bot.utils.rate_limiter import ws_limiter
 from bot.utils.logger import get_logger
@@ -70,7 +62,7 @@ def _update_dz_knowledge(view: dict):
 class WebSocketEngine:
     """Manages the gameplay WebSocket session."""
 
-    def __init__(self, game_id: str, agent_id: str, ws=None):
+    def __init__(self, game_id: str, agent_id: str):
         self.game_id = game_id
         self.agent_id = agent_id
         self.action_sender = ActionSender()
@@ -83,47 +75,12 @@ class WebSocketEngine:
         # Dashboard key/name — set by heartbeat before .run()
         self.dashboard_key = agent_id  # fallback to agent_id
         self.dashboard_name = "Agent"
-        # Pre-existing socket from /ws/join (skip connect when provided)
-        self._handoff_ws = ws
 
     async def run(self) -> dict:
         """
         Main gameplay loop. Returns game result dict.
-
-        If self._handoff_ws is set (came from WsJoinSession), use it directly —
-        the socket is already in gameplay mode, no need to re-dial.
-
-        Otherwise, dial /ws/agent fresh (IN_GAME resume path).
         Per gotchas.md: connect with X-API-Key only, no gameId/agentId params.
         """
-        # ── Path A: socket handed off from /ws/join ──────────────────
-        if self._handoff_ws is not None:
-            log.info("✅ Using handoff socket from /ws/join for game=%s", self.game_id)
-            self._running = True
-            self.ws = self._handoff_ws
-            try:
-                self._ping_task = asyncio.create_task(self._ping_loop())
-                async for raw_msg in self.ws:
-                    try:
-                        msg = json.loads(raw_msg)
-                        if not isinstance(msg, dict):
-                            continue
-                        result = await self._handle_message(msg)
-                        if result is not None:
-                            self._running = False
-                            return result
-                    except json.JSONDecodeError:
-                        log.warning("Non-JSON message: %s", raw_msg[:100])
-            except Exception as e:
-                log.error("Handoff socket error: %s — falling through to reconnect", e)
-            finally:
-                if self._ping_task:
-                    self._ping_task.cancel()
-            # If we fall out of the handoff loop without a result, reconnect below
-            self._handoff_ws = None
-
-        # ── Path B: fresh connect to /ws/agent (resume IN_GAME) ──────
-        # Per gotchas.md §1.5: use X-API-Key for /ws/agent (proven working)
         api_key = get_api_key()
         headers = {
             "X-API-Key": api_key,
@@ -267,19 +224,6 @@ class WebSocketEngine:
             event_type = msg.get("eventType", msg.get("data", {}).get("eventType", ""))
             log.debug("Event: %s", event_type)
 
-            # Ally detection from chat messages (v1.7.3)
-            if event_type in ("chat_message", "agent_talk", "agent_whisper"):
-                data = msg.get("data", {})
-                message = data.get("message", "")
-                sender_id = data.get("senderId") or data.get("agentId", "")
-                if message and sender_id:
-                    dec = decode_botspeak(message)
-                    if dec and dec.startswith("ALLY:"):
-                        secret = dec.split("ALLY:")[1]
-                        if secret == ALLY_SECRET:
-                            _set_ally(sender_id)
-                            log.info("🤝 Ally detected from chat: %s", sender_id[:8])
-
         # ── waiting ───────────────────────────────────────────────────
         elif msg_type == "waiting":
             log.info("Game is waiting for players...")
@@ -301,7 +245,7 @@ class WebSocketEngine:
         return None
 
     async def _on_agent_view(self, view: dict):
-        """Process agent_view → decide actions → send all sequentially."""
+        """Process agent_view → decide action → send if appropriate."""
         if not isinstance(view, dict):
             return
 
@@ -313,6 +257,7 @@ class WebSocketEngine:
 
         if not self_data.get("isAlive", True):
             log.info("☠️ Agent DEAD — Alive remaining: %s. Waiting for game_ended...", alive_count)
+            # Update dashboard with dead state (don't just return silently!)
             dk = self.dashboard_key
             dashboard_state.update_agent(dk, {
                 "name": self.dashboard_name,
@@ -348,28 +293,40 @@ class WebSocketEngine:
         enemies = [a for a in view.get("visibleAgents", [])
                    if isinstance(a, dict) and a.get("isAlive") and a.get("id") != self_data.get("id")]
 
+        # Region items: visibleItems entries are WRAPPED: { regionId, item: {id, name, ...} }
+        # We must unwrap the .item sub-object and attach regionId to it.
         region_id = region.get("id", "") if isinstance(region, dict) else ""
 
         def _unwrap_items(raw_items):
-            """Unwrap visibleItems: each entry is { regionId, item: {...} }."""
+            """Unwrap visibleItems: each entry is { regionId, item: {...} }.
+            Returns flat list of item dicts with regionId attached."""
             result = []
             for entry in raw_items:
                 if not isinstance(entry, dict):
                     continue
                 inner = entry.get("item")
                 if isinstance(inner, dict):
+                    # Attach regionId from wrapper to the inner item
                     inner["regionId"] = entry.get("regionId", "")
                     result.append(inner)
                 elif entry.get("id"):
+                    # Already a flat item (legacy format)
                     result.append(entry)
             return result
 
         region_items = []
+
+        # Strategy 1: currentRegion.items (some game versions embed items here)
         if isinstance(region, dict) and region.get("items"):
             region_items = _unwrap_items(region["items"])
+
+        # Strategy 2: filter visibleItems by regionId
         if not region_items:
             all_visible = _unwrap_items(view.get("visibleItems", []))
-            region_items = [i for i in all_visible if i.get("regionId") == region_id]
+            region_items = [i for i in all_visible
+                            if i.get("regionId") == region_id]
+
+        # Strategy 3: if regionId filter returns nothing, show ALL visible items
         if not region_items:
             all_visible = _unwrap_items(view.get("visibleItems", []))
             if all_visible:
@@ -383,12 +340,27 @@ class WebSocketEngine:
             from bot.strategy.brain import WEAPONS
             weapon_bonus = WEAPONS.get(weapon_name.lower(), {}).get("bonus", 0)
 
+
         def _item_label(i):
-            return (i.get("name") or i.get("typeId") or i.get("type")
+            """Get best display label for an item.
+            Try all possible field names the API might use.
+            """
+            return (i.get("name")
+                    or i.get("typeId")
+                    or i.get("type")
+                    or i.get("itemType")
+                    or i.get("itemName")
+                    or i.get("label")
+                    or i.get("kind")
                     or str(i.get("id", "?"))[:12])
 
         def _item_cat(i):
-            return (i.get("category") or i.get("cat") or i.get("type") or "")
+            """Get item category from any available field."""
+            return (i.get("category")
+                    or i.get("cat")
+                    or i.get("itemCategory")
+                    or i.get("type")
+                    or "")
 
         dk = self.dashboard_key
         dashboard_state.update_agent(dk, {
@@ -421,43 +393,33 @@ class WebSocketEngine:
         # Continuous DZ tracking from every view
         _update_dz_knowledge(view)
 
-        # ═══════════════════════════════════════════════════════════
-        #  🔥 Brain v1.7.3 — Free actions chaining + ally aware
-        # ═══════════════════════════════════════════════════════════
+        # Run strategy brain
         can_act = self.action_sender.can_send_cooldown_action()
-        actions = decide_actions(view, can_act)
+        decision = decide_action(view, can_act)
 
-        if not actions:
-            return  # Nothing to do this tick
+        if decision is None:
+            return  # No action needed now
 
-        last_reason = ""
-        last_action_type = ""
+        action_type = decision["action"]
+        action_data = decision.get("data", {})
+        reason = decision.get("reason", "")
 
-        for action in actions:
-            action_type = action["action"]
-            action_data = action.get("data", {})
-            reason = action.get("reason", "")
+        # Check if cooldown action is allowed
+        if action_type in COOLDOWN_ACTIONS and not can_act:
+            log.debug("Cooldown active — skipping %s", action_type)
+            return
 
-            # Only check cooldown for actions that require it (COOLDOWN_ACTIONS)
-            if action_type in COOLDOWN_ACTIONS and not can_act:
-                log.debug("Cooldown active — skipping %s", action_type)
-                continue
+        # Build and send per actions.md envelope spec
+        payload = self.action_sender.build_action(
+            action_type, action_data, reason, action_type,
+        )
 
-            # Build envelope per actions.md
-            payload = self.action_sender.build_action(
-                action_type, action_data, reason, action_type,
-            )
+        await self._send(payload)
+        log.info("→ %s | %s", action_type.upper(), reason)
 
-            await self._send(payload)
-            log.info("→ %s | %s", action_type.upper(), reason)
-
-            last_action_type = action_type
-            last_reason = reason
-
-        # Update dashboard with the last important action (usually main)
-        if last_action_type:
-            dashboard_state.update_agent(dk, {"last_action": f"{last_action_type}: {last_reason[:60]}"})
-            dashboard_state.add_log(f"{last_action_type}: {last_reason[:80]}", "info", dk)
+        # Feed dashboard with action
+        dashboard_state.update_agent(self.dashboard_key, {"last_action": f"{action_type}: {reason[:60]}"})
+        dashboard_state.add_log(f"{action_type}: {reason[:80]}", "info", self.dashboard_key)
 
     async def _send(self, payload: dict):
         """Send a message through WebSocket with rate limiting."""
@@ -477,8 +439,6 @@ class WebSocketEngine:
             pass
         except Exception as e:
             log.debug("Ping loop error: %s", e)
-
-
 """
 Per game-loop.md §9 Message Types:
 | Type              | Key Fields                                           |
