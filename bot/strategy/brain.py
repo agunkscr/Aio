@@ -1,12 +1,9 @@
 """
-Strategy brain v1.8.2 — EP-aware, smarter combat, loot chase, binoculars, inventory mgmt.
+Strategy brain v1.8.3 — EP-aware, smarter combat, loot chase, binoculars, inventory mgmt.
 All healing thresholds raised by +20 to keep agent healthier under pressure.
 
-Fixes from v1.8.1:
-- Binoculars now have cooldown (8 ticks) to prevent spam.
-- Free talk now has cooldown (10 ticks) and duplicate message prevention.
-- Utility items only used after can_act check.
-- Equip action skipped if best weapon is already equipped.
+Fixes from v1.8.2:
+- Added missing _find_safe_region() function (critical for death zone escape).
 """
 
 import base64
@@ -74,18 +71,18 @@ _map_knowledge: dict = {
     "revealed": False,
     "death_zones": set(),
     "safe_center": [],
-    "binoculars_last_used_tick": -999,      # NEW: cooldown tracker
+    "binoculars_last_used_tick": -999,
 }
 _combat_history: dict = {"last_hp": 100, "consecutive_damage_ticks": 0,
                            "last_attacker_id": "", "damage_this_tick": False}
 _explored_regions: set = set()
 _map_used_this_tick: bool = False
 
-# NEW: Talk cooldown globals
+# Talk cooldown globals
 _last_talk_tick: int = -999
 _last_talk_message: str = ""
 
-# NEW: Cooldown constants
+# Cooldown constants
 BINO_COOLDOWN_TICKS = 8
 TALK_COOLDOWN_TICKS = 10
 
@@ -136,7 +133,6 @@ def decode_botspeak(cipher: str) -> str:
 def _should_talk(view: dict, current_tick: int) -> str | None:
     global _last_talk_tick, _last_talk_message
 
-    # Cooldown
     if current_tick - _last_talk_tick < TALK_COOLDOWN_TICKS:
         return None
 
@@ -156,7 +152,6 @@ def _should_talk(view: dict, current_tick: int) -> str | None:
     elif len(enemies) == 1 and hp > 70:
         message = "Truce? Let's team up."
 
-    # Jangan kirim ulang pesan yang sama persis
     if message and message == _last_talk_message:
         return None
 
@@ -184,10 +179,10 @@ def get_free_actions(view: dict, current_tick: int) -> list[dict]:
         for item in inventory:
             if isinstance(item, dict) and item.get("typeId", "").lower() != "rewards":
                 drop_val = ITEM_DROP_VALUE.get(item.get("typeId", "").lower(), 1)
-                if drop_val <= 1:   # very low value
+                if drop_val <= 1:
                     actions.append({"action": "drop_item", "data": {"itemId": item["id"]},
                                     "reason": "PRE-DROP: keep space"})
-                    break  # only one per tick
+                    break
 
     # 1. Talk (with cooldown)
     message_plain = _should_talk(view, current_tick)
@@ -239,7 +234,6 @@ def get_free_actions(view: dict, current_tick: int) -> list[dict]:
                 best_weapon = item
                 best_score = score
 
-    # NEW: hanya equip jika senjata terbaik berbeda dengan yang sedang dipakai
     equipped_id = equipped.get("id") if equipped else None
     if best_weapon and best_weapon.get("id") != equipped_id:
         actions.append({"action": "equip", "data": {"itemId": best_weapon["id"]},
@@ -251,7 +245,7 @@ def get_free_actions(view: dict, current_tick: int) -> list[dict]:
 def decide_action(view: dict, can_act: bool, current_tick: int, memory_temp: dict = None) -> dict | None:
     """
     Main decision for EP‑cost actions.
-    v1.8.2: Utility items only tried after can_act check; binoculars have cooldown.
+    v1.8.3: Uses newly defined _find_safe_region for all escapes.
     """
     global _game_id, _map_used_this_tick, _explored_regions
 
@@ -303,7 +297,6 @@ def decide_action(view: dict, can_act: bool, current_tick: int, memory_temp: dic
     if not is_alive:
         return None
 
-    # Mark explored region
     if region_id:
         _explored_regions.add(region_id)
 
@@ -523,7 +516,7 @@ def reset_game_state():
     _map_used_this_tick = False
     _last_talk_tick = -999
     _last_talk_message = ""
-    log.info("Strategy brain reset (v1.8.2)")
+    log.info("Strategy brain reset (v1.8.3)")
 
 def _update_combat_history(current_hp: int, recent_logs: list, my_id: str):
     global _combat_history
@@ -606,7 +599,7 @@ def _use_utility_item(inventory: list, hp: int, ep: int, alive_count: int, curre
                     _map_knowledge["binoculars_last_used_tick"] = current_tick
                     return {"action": "use_item", "data": {"itemId": item["id"], "itemType": "binoculars"}, "reason": "UTILITY: Binoculars"}
 
-    # Megaphone in endgame (unchanged, but consider adding one‑time flag if reusable)
+    # Megaphone in endgame (unchanged)
     if alive_count <= 5 and hp > 50:
         for item in inventory:
             if isinstance(item, dict) and item.get("typeId", "").lower() == "megaphone":
@@ -637,7 +630,7 @@ def learn_from_map(view: dict):
 def _pickup_score(item: dict, inventory: list, heal_count: int) -> int:
     type_id = item.get("typeId", "").lower()
     if type_id == "rewards" or item.get("category","").lower() == "currency":
-        return 300   # always highest
+        return 300
     if item.get("category") == "weapon":
         bonus = WEAPONS.get(type_id, {}).get("bonus", 0)
         current_best = max((WEAPONS.get(i.get("typeId","").lower(),{}).get("bonus",0) for i in inventory if isinstance(i,dict) and i.get("category")=="weapon"), default=0)
@@ -803,4 +796,23 @@ def _resolve_region(entry, view: dict):
     if isinstance(entry, str):
         for r in view.get("visibleRegions", []):
             if isinstance(r, dict) and r.get("id") == entry: return r
+    return None
+
+def _find_safe_region(connections, danger_ids, view):
+    """
+    Return the ID of the first connected region that is not a death zone
+    and not in the danger set. Accepts both string IDs and dict entries.
+    """
+    for conn in connections:
+        if isinstance(conn, str):
+            if conn not in danger_ids:
+                # double-check via visibleRegions if possible
+                resolved = _resolve_region(conn, view)
+                if resolved and resolved.get("isDeathZone"):
+                    continue
+                return conn
+        elif isinstance(conn, dict):
+            rid = conn.get("id", "")
+            if rid and not conn.get("isDeathZone") and rid not in danger_ids:
+                return rid
     return None
