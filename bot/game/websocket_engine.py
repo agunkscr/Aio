@@ -62,7 +62,7 @@ def _update_dz_knowledge(view: dict):
 class WebSocketEngine:
     """Manages the gameplay WebSocket session."""
 
-    def __init__(self, game_id: str, agent_id: str):
+    def __init__(self, game_id: str, agent_id: str, ws=None):
         self.game_id = game_id
         self.agent_id = agent_id
         self.action_sender = ActionSender()
@@ -75,12 +75,46 @@ class WebSocketEngine:
         # Dashboard key/name — set by heartbeat before .run()
         self.dashboard_key = agent_id  # fallback to agent_id
         self.dashboard_name = "Agent"
+        # Pre-existing socket from /ws/join (skip connect when provided)
+        self._handoff_ws = ws
 
     async def run(self) -> dict:
         """
         Main gameplay loop. Returns game result dict.
+
+        If self._handoff_ws is set (came from WsJoinSession), use it directly —
+        the socket is already in gameplay mode, no need to re-dial.
+
+        Otherwise, dial /ws/agent fresh (IN_GAME resume path).
         Per gotchas.md: connect with X-API-Key only, no gameId/agentId params.
         """
+        # ── Path A: socket handed off from /ws/join ──────────────────
+        if self._handoff_ws is not None:
+            log.info("✅ Using handoff socket from /ws/join for game=%s", self.game_id)
+            self._running = True
+            self.ws = self._handoff_ws
+            try:
+                self._ping_task = asyncio.create_task(self._ping_loop())
+                async for raw_msg in self.ws:
+                    try:
+                        msg = json.loads(raw_msg)
+                        if not isinstance(msg, dict):
+                            continue
+                        result = await self._handle_message(msg)
+                        if result is not None:
+                            self._running = False
+                            return result
+                    except json.JSONDecodeError:
+                        log.warning("Non-JSON message: %s", raw_msg[:100])
+            except Exception as e:
+                log.error("Handoff socket error: %s — falling through to reconnect", e)
+            finally:
+                if self._ping_task:
+                    self._ping_task.cancel()
+            # If we fall out of the handoff loop without a result, reconnect below
+            self._handoff_ws = None
+
+        # ── Path B: fresh connect to /ws/agent (resume IN_GAME) ──────
         api_key = get_api_key()
         headers = {
             "X-API-Key": api_key,
