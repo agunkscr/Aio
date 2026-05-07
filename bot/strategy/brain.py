@@ -1,12 +1,12 @@
 """
-Strategy brain v1.8.1 — EP-aware, smarter combat, loot chase, binoculars, inventory mgmt.
+Strategy brain v1.8.2 — EP-aware, smarter combat, loot chase, binoculars, inventory mgmt.
 All healing thresholds raised by +20 to keep agent healthier under pressure.
 
-Fixes from v1.8.0:
-- Counter‑attack now respects can_act guard before resetting damage flag.
-- Guardian flee condition corrected to match comment (flee if damage > 60% HP).
-- _is_in_range() no longer assumes in‑range when target has no regionId.
-- Map utility only used once (when not yet revealed) – no more waste.
+Fixes from v1.8.1:
+- Binoculars now have cooldown (8 ticks) to prevent spam.
+- Free talk now has cooldown (10 ticks) and duplicate message prevention.
+- Utility items only used after can_act check.
+- Equip action skipped if best weapon is already equipped.
 """
 
 import base64
@@ -70,11 +70,24 @@ BOTSPEAK_POST_ROT = 1
 # ── Global state ──────────────────────────────────────────────────────
 _game_id: str = None
 _known_agents: dict = {}
-_map_knowledge: dict = {"revealed": False, "death_zones": set(), "safe_center": []}
+_map_knowledge: dict = {
+    "revealed": False,
+    "death_zones": set(),
+    "safe_center": [],
+    "binoculars_last_used_tick": -999,      # NEW: cooldown tracker
+}
 _combat_history: dict = {"last_hp": 100, "consecutive_damage_ticks": 0,
                            "last_attacker_id": "", "damage_this_tick": False}
 _explored_regions: set = set()
 _map_used_this_tick: bool = False
+
+# NEW: Talk cooldown globals
+_last_talk_tick: int = -999
+_last_talk_message: str = ""
+
+# NEW: Cooldown constants
+BINO_COOLDOWN_TICKS = 8
+TALK_COOLDOWN_TICKS = 10
 
 # ── Damage calculation ────────────────────────────────────────────────
 def calc_damage(atk: int, weapon_bonus: int, target_def: int, weather: str = "clear") -> int:
@@ -119,29 +132,45 @@ def decode_botspeak(cipher: str) -> str:
     except:
         return None
 
-# ── Communication decision (unchanged) ─────────────────────────────────
-def _should_talk(view: dict) -> str | None:
+# ── Communication decision (with cooldown & dedup) ────────────────────
+def _should_talk(view: dict, current_tick: int) -> str | None:
+    global _last_talk_tick, _last_talk_message
+
+    # Cooldown
+    if current_tick - _last_talk_tick < TALK_COOLDOWN_TICKS:
+        return None
+
     alive_count = view.get("aliveCount", 100)
     self_data = view.get("self", {})
     hp = self_data.get("hp", 100)
     enemies = [a for a in view.get("visibleAgents", [])
                if not a.get("isGuardian") and a.get("isAlive")]
 
+    message = None
     if alive_count <= 5 and hp > 60:
-        return "Free katana here! Come quick."
-    if enemies:
+        message = "Free katana here! Come quick."
+    elif enemies:
         weak = [e for e in enemies if e.get("hp", 100) < 40]
         if weak and hp > 50:
-            return "You are so weak, run!"
-    if len(enemies) == 1 and hp > 70:
-        return "Truce? Let's team up."
-    return None
+            message = "You are so weak, run!"
+    elif len(enemies) == 1 and hp > 70:
+        message = "Truce? Let's team up."
 
-# ── Free action chaining (v1.8.1 unchanged) ─────────────────────────────
-def get_free_actions(view: dict) -> list[dict]:
+    # Jangan kirim ulang pesan yang sama persis
+    if message and message == _last_talk_message:
+        return None
+
+    if message:
+        _last_talk_tick = current_tick
+        _last_talk_message = message
+
+    return message
+
+# ── Free action chaining ─────────────────────────────────────────────
+def get_free_actions(view: dict, current_tick: int) -> list[dict]:
     """
     Return list of free actions: pre‑drop junk → talk → drop if full → pickup → equip.
-    v1.8: pre‑drop when inventory ≥8, equip prefers ranged if enemies outside region.
+    v1.8.2: talk now respects cooldown & dedup; equip skipped if already using best.
     """
     actions = []
     self_data = view.get("self", {})
@@ -160,8 +189,8 @@ def get_free_actions(view: dict) -> list[dict]:
                                     "reason": "PRE-DROP: keep space"})
                     break  # only one per tick
 
-    # 1. Talk (BotSpeak removed, plain message)
-    message_plain = _should_talk(view)
+    # 1. Talk (with cooldown)
+    message_plain = _should_talk(view, current_tick)
     if message_plain:
         actions.append({"action": "talk", "data": {"message": message_plain}, "reason": "FREE TALK"})
 
@@ -190,7 +219,7 @@ def get_free_actions(view: dict) -> list[dict]:
             actions.append({"action": "pickup", "data": {"itemId": best["id"]},
                             "reason": "FREE PICKUP"})
 
-    # 3. Equip best weapon (v1.8: prefer ranged if enemies outside region)
+    # 3. Equip best weapon (skip if already equipped)
     enemies_visible = [a for a in view.get("visibleAgents", [])
                        if not a.get("isGuardian") and a.get("isAlive")]
     enemies_outside = [e for e in enemies_visible if e.get("regionId", "") != region_id]
@@ -209,21 +238,20 @@ def get_free_actions(view: dict) -> list[dict]:
             if score > best_score:
                 best_weapon = item
                 best_score = score
-    if best_weapon:
+
+    # NEW: hanya equip jika senjata terbaik berbeda dengan yang sedang dipakai
+    equipped_id = equipped.get("id") if equipped else None
+    if best_weapon and best_weapon.get("id") != equipped_id:
         actions.append({"action": "equip", "data": {"itemId": best_weapon["id"]},
                         "reason": "FREE EQUIP"})
 
     return actions
 
-# ── Main decision engine (v1.8.1 – fixed) ────────────────────────────
-def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict | None:
+# ── Main decision engine ────────────────────────────────────────────
+def decide_action(view: dict, can_act: bool, current_tick: int, memory_temp: dict = None) -> dict | None:
     """
     Main decision for EP‑cost actions.
-    v1.8.1 fixes:
-      - Counter‑attack respects can_act before resetting damage flag.
-      - Guardian flee condition corrected: flee if guardian's damage > 60% HP.
-      - _is_in_range() no longer assumes in‑range when target has no regionId.
-      - Emergency energy drink before combat if EP ≤ 2.
+    v1.8.2: Utility items only tried after can_act check; binoculars have cooldown.
     """
     global _game_id, _map_used_this_tick, _explored_regions
 
@@ -254,7 +282,7 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
     alive_count      = view.get("aliveCount", 100)
     recent_logs      = view.get("recentLogs", [])
 
-    # Unwrap visibleItems (needed for map/megaphone/binoculars detection)
+    # Unwrap visibleItems
     visible_items = []
     for entry in visible_items_raw:
         if not isinstance(entry, dict):
@@ -279,7 +307,6 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
     if region_id:
         _explored_regions.add(region_id)
 
-    # Trigger learn_from_map if Map was used
     if _map_used_this_tick:
         _map_used_this_tick = False
         learn_from_map(view)
@@ -323,7 +350,7 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
         if safe:
             return {"action": "move", "data": {"regionId": safe}, "reason": "DESPERATE FLEE"}
 
-    # 1d. Counter-attack (now respects can_act)
+    # 1d. Counter-attack
     if _combat_history.get("damage_this_tick"):
         attacker_id = _combat_history["last_attacker_id"]
         if attacker_id == "unknown" or not attacker_id:
@@ -338,43 +365,36 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
         if attacker:
             w_range = get_weapon_range(equipped)
             if _is_in_range(attacker, region_id, w_range, connections):
-                if not can_act:  # v1.8.1: do NOT reset flag if we cannot act yet
+                if not can_act:
                     return None
                 my_dmg = calc_damage(atk, get_weapon_bonus(equipped), attacker.get("def", 5), region_weather)
                 log.warning("⚔️ Counter-attack!")
                 _combat_history["damage_this_tick"] = False
                 return {"action": "attack", "data": {"targetId": attacker["id"], "targetType": "agent"}, "reason": "COUNTER-ATTACK"}
             else:
-                if not can_act:  # also check before moving
+                if not can_act:
                     return None
                 move = _move_toward_target(attacker, connections, danger_ids, view)
                 if move:
                     _combat_history["damage_this_tick"] = False
                     return {"action": "move", "data": {"regionId": move}, "reason": "CHASE attacker"}
 
-    # 1e. Emergency energy drink (if EP ≤ 2 and threats nearby) — v1.8.0
+    # 1e. Emergency energy drink
     if ep <= 2 and (enemies_alive or guardians_here):
         drink = _find_energy_drink(inventory)
         if drink:
             return {"action": "use_item", "data": {"itemId": drink["id"]}, "reason": "EMERGENCY ENERGY DRINK"}
 
-    # 2b. Guardian evasion (nuanced: flee if guardian damage > 60% HP) — v1.8.1 fixed
+    # 2b. Guardian evasion
     if guardians_here and ep >= move_ep_cost:
         threat = max(guardians_here, key=lambda g: g.get("atk", 10))
         g_dmg = calc_damage(threat.get("atk", 10), _estimate_enemy_weapon_bonus(threat), defense, region_weather)
-        # Fixed condition: flee if guardian's potential damage exceeds 60% of current HP
         if hp < max(35, int(g_dmg * 1.5)) or g_dmg > hp * 0.6:
             safe = _find_safe_region(connections, danger_ids, view)
             if safe:
                 return {"action": "move", "data": {"regionId": safe}, "reason": "GUARDIAN FLEE"}
 
-    # 3. Use utility items (Map, Binoculars, Megaphone) — v1.8.1: map only if not yet revealed
-    util = _use_utility_item(inventory, hp, ep, alive_count)
-    if util:
-        if util.get("data", {}).get("itemType") == "map":
-            _map_used_this_tick = True
-        return util
-
+    # ── CRITICAL FIX: cek can_act di sini, SEBELUM utility ──
     if not can_act:
         return None
 
@@ -389,20 +409,27 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
         if heal:
             return {"action": "use_item", "data": {"itemId": heal["id"]}, "reason": "HEAL"}
 
-    # Regular energy drink (when EP low but no immediate threats)
+    # Regular energy drink
     if ep <= 2 and ep < max_ep:
         drink = _find_energy_drink(inventory)
         if drink:
             return {"action": "use_item", "data": {"itemId": drink["id"]}, "reason": "EP RECOVERY"}
 
-    # 5. Guardian farming (with better target selection)
+    # 3. Use utility items (now safely after can_act, with cooldowns)
+    util = _use_utility_item(inventory, hp, ep, alive_count, current_tick)
+    if util:
+        if util.get("data", {}).get("itemType") == "map":
+            _map_used_this_tick = True
+        return util
+
+    # 5. Guardian farming
     guardians = [a for a in visible_agents if a.get("isGuardian") and a.get("isAlive")]
-    if guardians and ep >= 2 and hp >= 35:   # raised to 35
+    if guardians and ep >= 2 and hp >= 35:
         target = _select_best_combat_target(guardians, atk, equipped, defense, region_weather, target_type="guardian")
         if _is_in_range(target, region_id, get_weapon_range(equipped), connections):
             my_dmg = calc_damage(atk, get_weapon_bonus(equipped), target.get("def", 5), region_weather)
             g_dmg = calc_damage(target.get("atk", 10), _estimate_enemy_weapon_bonus(target), defense, region_weather)
-            if my_dmg >= g_dmg or target.get("hp", 100) <= my_dmg * 2:   # easier condition
+            if my_dmg >= g_dmg or target.get("hp", 100) <= my_dmg * 2:
                 return {"action": "attack", "data": {"targetId": target["id"], "targetType": "agent"}, "reason": "GUARDIAN FARM"}
         else:
             move = _move_toward_target(target, connections, danger_ids, view)
@@ -457,7 +484,7 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
         if facility:
             return {"action": "interact", "data": {"interactableId": facility["id"]}, "reason": f"FACILITY: {facility.get('type')}"}
 
-    # 8b. Loot chase (improved: consider inventory space)
+    # 8b. Loot chase
     if ep >= move_ep_cost and connections:
         loot_region, loot_name = _find_valuable_item_region(
             connections, danger_ids, visible_items_raw, inventory, view, hp
@@ -477,23 +504,26 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
 
     return None
 
-# ── Combined decision for engine (unchanged) ───────────────────────────
-def decide_actions(view: dict, can_act: bool) -> list[dict]:
-    free = get_free_actions(view)
-    main = decide_action(view, can_act)
+# ── Combined decision for engine ───────────────────────────────────
+def decide_actions(view: dict, can_act: bool, current_tick: int = 0) -> list[dict]:
+    free = get_free_actions(view, current_tick)
+    main = decide_action(view, can_act, current_tick)
     if main:
         free.append(main)
     return free
 
-# ── Helper functions (updated where needed) ────────────────────────────
+# ── Helper functions (updated where needed) ─────────────────────────
 def reset_game_state():
     global _known_agents, _map_knowledge, _combat_history, _explored_regions, _map_used_this_tick
+    global _last_talk_tick, _last_talk_message
     _known_agents = {}
-    _map_knowledge = {"revealed": False, "death_zones": set(), "safe_center": []}
+    _map_knowledge = {"revealed": False, "death_zones": set(), "safe_center": [], "binoculars_last_used_tick": -999}
     _combat_history = {"last_hp": 100, "consecutive_damage_ticks": 0, "last_attacker_id": "", "damage_this_tick": False}
     _explored_regions = set()
     _map_used_this_tick = False
-    log.info("Strategy brain reset (v1.8.1)")
+    _last_talk_tick = -999
+    _last_talk_message = ""
+    log.info("Strategy brain reset (v1.8.2)")
 
 def _update_combat_history(current_hp: int, recent_logs: list, my_id: str):
     global _combat_history
@@ -528,7 +558,6 @@ def _estimate_enemy_weapon_bonus(agent: dict) -> int:
 
 def _select_best_combat_target(targets: list, my_atk: int, equipped, my_def: int, weather: str,
                                target_type: str = "agent") -> dict:
-    """v1.8: added target_type to boost guardian score, prefer low‑HP targets."""
     best, best_score = None, -9999
     my_bonus = get_weapon_bonus(equipped)
     for t in targets:
@@ -537,13 +566,10 @@ def _select_best_combat_target(targets: list, my_atk: int, equipped, my_def: int
         my_dmg = calc_damage(my_atk, my_bonus, t.get("def", 5), weather)
         their_dmg = calc_damage(t.get("atk", 10), _estimate_enemy_weapon_bonus(t), my_def, weather)
         score = (my_dmg / t_hp) * 100 - their_dmg * 0.5
-        # Guardian bonus
         if t.get("isGuardian"):
             score += 15
-        # Prefer low‑HP (killable in 1-2 hits)
         if t_hp <= my_dmg * 2:
             score += 20
-        # Penalty if enemy has high weapon bonus
         enemy_bonus = _estimate_enemy_weapon_bonus(t)
         if enemy_bonus >= 20:
             score -= 10
@@ -563,22 +589,29 @@ def _track_agents(visible_agents: list, my_id: str, my_region: str):
             "lastSeen": my_region, "isAlive": agent.get("isAlive", True),
         }
 
-def _use_utility_item(inventory: list, hp: int, ep: int, alive_count: int) -> dict | None:
-    # Map first (only if not yet revealed – v1.8.1 fix)
+def _use_utility_item(inventory: list, hp: int, ep: int, alive_count: int, current_tick: int) -> dict | None:
+    global _map_knowledge
+    # Map first (only if not yet revealed)
     if not _map_knowledge.get("revealed", False):
         for item in inventory:
             if isinstance(item, dict) and item.get("typeId", "").lower() == "map":
                 return {"action": "use_item", "data": {"itemId": item["id"], "itemType": "map"}, "reason": "UTILITY: Map"}
-    # Binoculars next (if many players alive)
+
+    # Binoculars with cooldown
     if alive_count > 15:
-        for item in inventory:
-            if isinstance(item, dict) and item.get("typeId", "").lower() == "binoculars":
-                return {"action": "use_item", "data": {"itemId": item["id"], "itemType": "binoculars"}, "reason": "UTILITY: Binoculars"}
-    # Megaphone in endgame
+        ticks_since = current_tick - _map_knowledge.get("binoculars_last_used_tick", -999)
+        if ticks_since >= BINO_COOLDOWN_TICKS:
+            for item in inventory:
+                if isinstance(item, dict) and item.get("typeId", "").lower() == "binoculars":
+                    _map_knowledge["binoculars_last_used_tick"] = current_tick
+                    return {"action": "use_item", "data": {"itemId": item["id"], "itemType": "binoculars"}, "reason": "UTILITY: Binoculars"}
+
+    # Megaphone in endgame (unchanged, but consider adding one‑time flag if reusable)
     if alive_count <= 5 and hp > 50:
         for item in inventory:
             if isinstance(item, dict) and item.get("typeId", "").lower() == "megaphone":
                 return {"action": "use_item", "data": {"itemId": item["id"], "itemType": "megaphone"}, "reason": "UTILITY: Megaphone"}
+
     return None
 
 def learn_from_map(view: dict):
@@ -618,7 +651,6 @@ def _pickup_score(item: dict, inventory: list, heal_count: int) -> int:
     return ITEM_PRIORITY.get(type_id, 0)
 
 def _find_droppable_item(inventory: list, target_item: dict) -> dict | None:
-    """Drop the item with the lowest value, but never drop rewards (currency)."""
     candidates = [(i, ITEM_DROP_VALUE.get(i.get("typeId","").lower(), 1))
                   for i in inventory if isinstance(i,dict) 
                   and i.get("typeId","").lower() != "rewards"
@@ -653,10 +685,9 @@ def _select_facility(interactables: list, hp, ep, alive_count):
     return best
 
 def _is_in_range(target, my_region, weapon_range, connections):
-    """v1.8.1 fixed: target without regionId is NOT considered in range."""
     tr = target.get("regionId", "")
     if not tr:
-        return False  # cannot attack unknown location
+        return False
     if tr == my_region:
         return True
     if weapon_range >= 1 and connections:
@@ -678,7 +709,6 @@ def _move_toward_target(target, connections, danger_ids, view):
     return None
 
 def _find_valuable_item_region(connections, danger_ids, visible_items, inventory, view, hp=100) -> tuple:
-    """Loot chase: higher score if inventory has space, ignore danger if HP high."""
     if not visible_items:
         return None, None
 
