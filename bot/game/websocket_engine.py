@@ -23,7 +23,6 @@ from bot.strategy.brain import (
     reset_game_state,
     learn_from_map,
     decode_botspeak,
-    ALLY_SECRET,
     _set_ally,
 )
 from bot.dashboard.state import dashboard_state
